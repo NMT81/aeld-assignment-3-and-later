@@ -1,4 +1,9 @@
 #include "systemcalls.h"
+#include <stdlib.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <sys/types.h>
+#include <sys/wait.h>
 
 /**
  * @param cmd the command to execute with system()
@@ -16,8 +21,18 @@ bool do_system(const char *cmd)
  *   and return a boolean true if the system() call completed with success
  *   or false() if it returned a failure
 */
-
-    return true;
+    bool ret = true;
+    int cmd_ret = system(cmd);
+    if (WIFEXITED(cmd_ret)) {
+        if (WEXITSTATUS(cmd_ret) == 0) {
+            ret = true;
+        } else {
+            ret = false;
+        }
+    } else {
+        ret = false;
+    }
+    return ret;
 }
 
 /**
@@ -40,6 +55,9 @@ bool do_exec(int count, ...)
     va_start(args, count);
     char * command[count+1];
     int i;
+    bool ret = true;
+    pid_t pid;
+    int cmd_ret;
     for(i=0; i<count; i++)
     {
         command[i] = va_arg(args, char *);
@@ -58,10 +76,26 @@ bool do_exec(int count, ...)
  *   as second argument to the execv() command.
  *
 */
+    pid = fork();
+
+    if (pid < 0) { 
+        ret = false;
+    }
+    else if (pid == 0) {
+        execv(command[0], command);
+        exit(1);
+    }else {
+        waitpid(pid, &cmd_ret, 0);
+        if (WIFEXITED(cmd_ret)) {
+            if (WEXITSTATUS(cmd_ret) == 0) { ret = true;} 
+            else { ret = false;}
+        } 
+        else { ret = false;}
+    }
 
     va_end(args);
 
-    return true;
+    return ret;
 }
 
 /**
@@ -75,6 +109,9 @@ bool do_exec_redirect(const char *outputfile, int count, ...)
     va_start(args, count);
     char * command[count+1];
     int i;
+    bool ret = true;
+    pid_t pid;
+    int cmd_ret;
     for(i=0; i<count; i++)
     {
         command[i] = va_arg(args, char *);
@@ -92,8 +129,33 @@ bool do_exec_redirect(const char *outputfile, int count, ...)
  *   The rest of the behaviour is same as do_exec()
  *
 */
+    pid = fork();
+
+    if (pid < 0) { 
+        ret = false;
+    }
+    else if (pid == 0) {
+        int fd = open(outputfile, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (fd < 0) {
+            exit(1);
+        }
+        if (dup2(fd, 1) < 0) {
+            close(fd);
+            exit(1);
+        }
+        close(fd);
+        execv(command[0], command);
+        exit(1);
+    }else {
+        waitpid(pid, &cmd_ret, 0);
+        if (WIFEXITED(cmd_ret)) {
+            if (WEXITSTATUS(cmd_ret) == 0) { ret = true;} 
+            else { ret = false;}
+        } 
+        else { ret = false;}
+    }
 
     va_end(args);
 
-    return true;
+    return ret;
 }
