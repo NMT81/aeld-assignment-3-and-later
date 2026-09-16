@@ -13,6 +13,7 @@
 
 #define BUFFER_SIZE 1024
 #define TMP_DATA "/var/tmp/aesdsocketdata"
+#define CHILD_PIDFILE "/var/tmp/aesdsocket.pid"
 
 volatile bool signal_captured = false;
 
@@ -70,6 +71,11 @@ int main (int argc, char *argv[])
     if ((argc > 1) && (strcmp(argv[1],"-d") == 0)){
         pid = fork();
         if (pid > 0){           //parent process
+            int pid_fd = open(CHILD_PIDFILE, O_RDWR | O_CREAT | O_TRUNC, 0644);
+            char pid_buf[20] = {0};
+            snprintf(pid_buf, sizeof(pid_buf), "%d", pid);
+            write(pid_fd, pid_buf, sizeof(pid_buf));
+            close(pid_fd);
             return 0;
         } else if (pid == 0){   //child process
             setsid();           // start new session
@@ -152,6 +158,7 @@ int main (int argc, char *argv[])
     closelog();
     close(tmp_fd);
     remove(TMP_DATA);
+    remove(CHILD_PIDFILE);
 
     return 0;
 }
