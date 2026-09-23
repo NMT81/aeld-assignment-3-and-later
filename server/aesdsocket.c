@@ -1,4 +1,5 @@
 #include <stdio.h>
+#include <stdlib.h>
 #include <stdbool.h>
 #include <signal.h>
 #include <sys/types.h>
@@ -10,12 +11,42 @@
 #include <unistd.h>
 #include <syslog.h>
 #include <string.h>
+#include <pthread.h>
+#include <time.h>
+#include <sys/queue.h>
+#include <errno.h>
 
 #define BUFFER_SIZE 1024
 #define TMP_DATA "/var/tmp/aesdsocketdata"
 #define CHILD_PIDFILE "/var/tmp/aesdsocket.pid"
 
+#ifndef SO_REUSEPORT
+#define SO_REUSEPORT 15
+#endif
+
+#ifndef SLIST_FOREACH_SAFE
+#define SLIST_FOREACH_SAFE(var, head, field, tvar) \
+    for ((var) = SLIST_FIRST((head)); \
+        (var) && ((tvar) = SLIST_NEXT((var), field), 1); \
+        (var) = (tvar))
+#endif
+
+struct thread_node {
+    pthread_t thread_id;
+    int log_fd;
+    int client_fd;
+    bool finished;
+    char ip[INET6_ADDRSTRLEN];
+    SLIST_ENTRY(thread_node) entries;
+};
+SLIST_HEAD(thread_list_head, thread_node) thread_head = SLIST_HEAD_INITIALIZER(thread_head);
+
 volatile bool signal_captured = false;
+int tmp_data_size = 0;
+int tmp_data_fd = 0;
+
+pthread_mutex_t file_mutex = PTHREAD_MUTEX_INITIALIZER;
+pthread_mutex_t node_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 void handle_signal(int signal_num) {
 
@@ -25,18 +56,89 @@ void handle_signal(int signal_num) {
     }
 }
 
+void* time_worker(void* arg) {
+    int tm_fd = *(int*)arg;
+    char time_str[30] = {0};
+    char i;
+    time_t now;
+    struct tm *tm_info;
+    struct timespec ts;
+    ts.tv_sec = 1;
+    ts.tv_nsec = 0;
+
+    while (!signal_captured) {
+        for(i=0; ((i<10) && (!signal_captured)); i++){
+            nanosleep(&ts, NULL);
+        }
+        if (signal_captured) break;
+
+        now = time(NULL);
+        tm_info = localtime(&now);
+        strftime(time_str, sizeof(time_str), "timestamp:%Y-%m-%d %H:%M:%S\n", tm_info);
+
+        pthread_mutex_lock(&file_mutex);
+        write(tm_fd, time_str, sizeof(time_str));
+        tmp_data_size += sizeof(time_str);
+        pthread_mutex_unlock(&file_mutex);
+    }
+
+    return NULL;
+}
+
+void* client_worker(void* arg) {
+    struct thread_node* node = (struct thread_node*)arg;
+    ssize_t bytes_received;
+    char buf[BUFFER_SIZE];
+
+    pthread_mutex_lock(&file_mutex);
+    while(!signal_captured)
+    {
+        bytes_received = recv(node->client_fd, buf, BUFFER_SIZE - 1, 0);
+        if (bytes_received == -1) {         // error or signal arrived
+            break;
+        } else {
+            write(node->log_fd, buf, bytes_received);
+            tmp_data_size += bytes_received;
+            if (buf[bytes_received - 1] == '\n')
+            {
+                off_t offset = 0;
+                sendfile(node->client_fd, node->log_fd, &offset, tmp_data_size);
+                break;
+            }
+        }
+    }
+    pthread_mutex_unlock(&file_mutex);
+
+    close(node->client_fd);
+    node->finished = true;
+    syslog(LOG_DEBUG, "Closed connection from %s", node->ip);
+
+    return NULL;
+}
+
+void reap_worker(void) {
+    struct thread_node *np, *tmp;
+    pthread_mutex_lock(&node_mutex);
+    SLIST_FOREACH_SAFE(np, &thread_head, entries, tmp) {
+        if (np->finished) {
+            pthread_join(np->thread_id, NULL);
+            SLIST_REMOVE(&thread_head, np, thread_node, entries);
+            free(np);
+        }
+    }
+    pthread_mutex_unlock(&node_mutex);
+}
+
 int main (int argc, char *argv[])
 {
     struct sigaction sa;
-    int server_fd, client_fd, tmp_fd, bytes_received;
+    int server_fd, client_fd;
     struct addrinfo hints, *res, *p;
     struct sockaddr_storage client_addr;
     socklen_t addr_size;
-    char buf[BUFFER_SIZE];
-    char ip[INET6_ADDRSTRLEN];
-    int tmp_data_size;
     int yes = 1;
     pid_t pid;
+    pthread_t tm_tid;
 
     // Setup stream socket binding on port 9000
     memset(&hints, 0, sizeof(hints));
@@ -46,7 +148,7 @@ int main (int argc, char *argv[])
 
     if (getaddrinfo(NULL, "9000", &hints, &res) != 0) {
         printf("fail getaddrinfo\n\r");
-        return -1;
+        return 2;
     }
     for (p = res; p != NULL; p = p->ai_next) {
         server_fd = socket(p->ai_family, p->ai_socktype, p->ai_protocol);
@@ -55,6 +157,7 @@ int main (int argc, char *argv[])
         }
 
         setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(int));
+        setsockopt(server_fd, SOL_SOCKET, SO_REUSEPORT, &yes, sizeof(int));
 
         if (bind(server_fd, p->ai_addr, p->ai_addrlen) == 0) {
             break;
@@ -64,7 +167,7 @@ int main (int argc, char *argv[])
     freeaddrinfo(res);
     if (p == NULL) {
         printf("Fail setting socket\n\r");
-        return -1;
+        return 3;
     }
 
     // check argument, create deamon
@@ -101,64 +204,70 @@ int main (int argc, char *argv[])
         return 1;
     }
 
-    if (listen(server_fd, 5) == -1) {
+    if (listen(server_fd, 10) == -1) {
         close(server_fd);
-        return -1;
+        return 4;
     }
 
     // Setup logging
     openlog(argv[0], LOG_PID, LOG_USER);
 
-    tmp_fd = open(TMP_DATA, O_RDWR | O_CREAT | O_APPEND, 0644);
+    tmp_data_fd = open(TMP_DATA, O_RDWR | O_CREAT | O_TRUNC, 0644);
     tmp_data_size = 0;
 
-    // loop accept, receive, send
-    while(1)
+    if (pthread_create(&tm_tid, NULL, time_worker, &tmp_data_fd) != 0)
     {
+        perror("time worker thread starting fail");
+    }
+
+    // loop accept, receive, send
+    while(!signal_captured)
+    {
+        reap_worker();
         addr_size = sizeof(client_addr);
         client_fd = accept(server_fd, (struct sockaddr *)&client_addr, &addr_size);
         if (client_fd == -1) {
             break;
         }
+        struct thread_node* new_node = malloc(sizeof(struct thread_node));
+        if (!new_node) {
+            close(client_fd);
+            continue;
+        }        
         getnameinfo((struct sockaddr *)&client_addr, addr_size,
-                      ip, sizeof(ip), 
+                      new_node->ip, sizeof(new_node->ip), 
                       NULL, 0,
                       NI_NUMERICHOST);
-        syslog(LOG_DEBUG, "Accepted connection from %s", ip);        
+        syslog(LOG_DEBUG, "Accepted connection from %s", new_node->ip);
+        new_node->client_fd = client_fd;
+        new_node->finished = false;
+        new_node->log_fd = tmp_data_fd;
 
-        while(1)
-        {
-            //memset(buf, 0, BUFFER_SIZE);
-            bytes_received = recv(client_fd, buf, BUFFER_SIZE - 1, 0);
-            if (bytes_received == -1) {         // error or signal arrived
-                break;
-            } else {
-                write(tmp_fd, buf, bytes_received);
-                tmp_data_size += bytes_received;
-                if (buf[bytes_received - 1] == '\n')
-                {
-                    off_t offset = 0;
-                    sendfile(client_fd, tmp_fd, &offset, tmp_data_size);
-                    break;
-                }
-            }
-        }
-        close(client_fd);
-        
-        if (signal_captured){
-            break;
-        } else {
-            syslog(LOG_DEBUG, "Closed connection from %s", ip);
+        pthread_mutex_lock(&node_mutex);
+        SLIST_INSERT_HEAD(&thread_head, new_node, entries);
+        pthread_mutex_unlock(&node_mutex);
+
+        if (pthread_create(&new_node->thread_id, NULL, client_worker, new_node) != 0) {
+            pthread_mutex_lock(&node_mutex);
+            SLIST_REMOVE(&thread_head, new_node, thread_node, entries);
+            pthread_mutex_unlock(&node_mutex);            
+            close(client_fd);
+            free(new_node);
         }
     }
     if (signal_captured){
         syslog(LOG_DEBUG, "Caught signal, exiting");
     }
+    while (!SLIST_EMPTY(&thread_head)) {
+        reap_worker();
+    }
+    pthread_join(tm_tid, NULL);
     close(server_fd);
+    close(tmp_data_fd);
+    pthread_mutex_destroy(&node_mutex);
+    pthread_mutex_destroy(&file_mutex);
     closelog();
-    close(tmp_fd);
-    remove(TMP_DATA);
     remove(CHILD_PIDFILE);
-
+    remove(TMP_DATA);
     return 0;
 }
