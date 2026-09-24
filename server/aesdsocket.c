@@ -42,6 +42,7 @@ struct thread_node {
 SLIST_HEAD(thread_list_head, thread_node) thread_head = SLIST_HEAD_INITIALIZER(thread_head);
 
 volatile bool signal_captured = false;
+bool enable_time_worker = false;
 int tmp_data_size = 0;
 int tmp_data_fd = 0;
 
@@ -58,7 +59,7 @@ void handle_signal(int signal_num) {
 
 void* time_worker(void* arg) {
     int tm_fd = *(int*)arg;
-    char time_str[30] = {0};
+    char time_str[31] = {0};
     char i;
     time_t now;
     struct tm *tm_info;
@@ -75,11 +76,12 @@ void* time_worker(void* arg) {
         now = time(NULL);
         tm_info = localtime(&now);
         strftime(time_str, sizeof(time_str), "timestamp:%Y-%m-%d %H:%M:%S\n", tm_info);
-
-        pthread_mutex_lock(&file_mutex);
-        write(tm_fd, time_str, sizeof(time_str));
-        tmp_data_size += sizeof(time_str);
-        pthread_mutex_unlock(&file_mutex);
+        if (enable_time_worker){
+            pthread_mutex_lock(&file_mutex);
+            write(tm_fd, time_str, sizeof(time_str));
+            tmp_data_size += sizeof(time_str);
+            pthread_mutex_unlock(&file_mutex);
+        }
     }
 
     return NULL;
@@ -215,10 +217,7 @@ int main (int argc, char *argv[])
     tmp_data_fd = open(TMP_DATA, O_RDWR | O_CREAT | O_TRUNC, 0644);
     tmp_data_size = 0;
 
-    if (pthread_create(&tm_tid, NULL, time_worker, &tmp_data_fd) != 0)
-    {
-        perror("time worker thread starting fail");
-    }
+    pthread_create(&tm_tid, NULL, time_worker, &tmp_data_fd);
 
     // loop accept, receive, send
     while(!signal_captured)
@@ -242,7 +241,7 @@ int main (int argc, char *argv[])
         new_node->client_fd = client_fd;
         new_node->finished = false;
         new_node->log_fd = tmp_data_fd;
-
+        enable_time_worker = true;
         pthread_mutex_lock(&node_mutex);
         SLIST_INSERT_HEAD(&thread_head, new_node, entries);
         pthread_mutex_unlock(&node_mutex);
