@@ -16,8 +16,13 @@
 #include <sys/queue.h>
 #include <errno.h>
 
+#define USE_AESD_CHAR_DEVICE 1
 #define BUFFER_SIZE 1024
+#if USE_AESD_CHAR_DEVICE
+#define TMP_DATA "/dev/aesdchar"
+#else
 #define TMP_DATA "/var/tmp/aesdsocketdata"
+#endif
 #define CHILD_PIDFILE "/var/tmp/aesdsocket.pid"
 
 #ifndef SO_REUSEPORT
@@ -42,7 +47,10 @@ struct thread_node {
 SLIST_HEAD(thread_list_head, thread_node) thread_head = SLIST_HEAD_INITIALIZER(thread_head);
 
 volatile bool signal_captured = false;
+bool tmp_data_opened = false;
+#if !USE_AESD_CHAR_DEVICE
 bool enable_time_worker = false;
+#endif
 int tmp_data_size = 0;
 int tmp_data_fd = 0;
 
@@ -57,6 +65,7 @@ void handle_signal(int signal_num) {
     }
 }
 
+#if !USE_AESD_CHAR_DEVICE
 void* time_worker(void* arg) {
     int tm_fd = *(int*)arg;
     char time_str[31] = {0};
@@ -86,11 +95,16 @@ void* time_worker(void* arg) {
 
     return NULL;
 }
+#endif
 
 void* client_worker(void* arg) {
     struct thread_node* node = (struct thread_node*)arg;
     ssize_t bytes_received;
     char buf[BUFFER_SIZE];
+    #if USE_AESD_CHAR_DEVICE
+    ssize_t bytes_read;
+    char buffer[BUFFER_SIZE];
+    #endif
 
     pthread_mutex_lock(&file_mutex);
     while(!signal_captured)
@@ -103,8 +117,15 @@ void* client_worker(void* arg) {
             tmp_data_size += bytes_received;
             if (buf[bytes_received - 1] == '\n')
             {
+                #if USE_AESD_CHAR_DEVICE
+                lseek(node->log_fd, 0, SEEK_SET);
+                while ((bytes_read = read(node->log_fd, buffer, BUFFER_SIZE)) > 0) {
+                    write(node->client_fd, buffer, bytes_read);
+                }
+                #else
                 off_t offset = 0;
                 sendfile(node->client_fd, node->log_fd, &offset, tmp_data_size);
+                #endif
                 break;
             }
         }
@@ -140,8 +161,9 @@ int main (int argc, char *argv[])
     socklen_t addr_size;
     int yes = 1;
     pid_t pid;
+    #if !USE_AESD_CHAR_DEVICE
     pthread_t tm_tid;
-
+    #endif
     // Setup stream socket binding on port 9000
     memset(&hints, 0, sizeof(hints));
     hints.ai_family = AF_UNSPEC;
@@ -212,13 +234,12 @@ int main (int argc, char *argv[])
     }
 
     // Setup logging
-    openlog(argv[0], LOG_PID, LOG_USER);
-
-    tmp_data_fd = open(TMP_DATA, O_RDWR | O_CREAT | O_TRUNC, 0644);
-    tmp_data_size = 0;
-
+    openlog(argv[0], LOG_PID, LOG_USER);    
+    
+    #if !USE_AESD_CHAR_DEVICE
     pthread_create(&tm_tid, NULL, time_worker, &tmp_data_fd);
-
+    #endif
+    tmp_data_size = 0;
     // loop accept, receive, send
     while(!signal_captured)
     {
@@ -238,10 +259,20 @@ int main (int argc, char *argv[])
                       NULL, 0,
                       NI_NUMERICHOST);
         syslog(LOG_DEBUG, "Accepted connection from %s", new_node->ip);
+        if(!tmp_data_opened){
+            tmp_data_opened = true;
+            #if USE_AESD_CHAR_DEVICE
+            tmp_data_fd = open(TMP_DATA, O_RDWR);
+            #else
+            tmp_data_fd = open(TMP_DATA, O_RDWR | O_CREAT | O_TRUNC, 0644);
+            #endif            
+        }
         new_node->client_fd = client_fd;
         new_node->finished = false;
         new_node->log_fd = tmp_data_fd;
+        #if !USE_AESD_CHAR_DEVICE
         enable_time_worker = true;
+        #endif
         pthread_mutex_lock(&node_mutex);
         SLIST_INSERT_HEAD(&thread_head, new_node, entries);
         pthread_mutex_unlock(&node_mutex);
@@ -260,13 +291,16 @@ int main (int argc, char *argv[])
     while (!SLIST_EMPTY(&thread_head)) {
         reap_worker();
     }
+    #if !USE_AESD_CHAR_DEVICE
     pthread_join(tm_tid, NULL);
+    remove(TMP_DATA);
+    #endif
     close(server_fd);
     close(tmp_data_fd);
     pthread_mutex_destroy(&node_mutex);
     pthread_mutex_destroy(&file_mutex);
     closelog();
     remove(CHILD_PIDFILE);
-    remove(TMP_DATA);
+    
     return 0;
 }
